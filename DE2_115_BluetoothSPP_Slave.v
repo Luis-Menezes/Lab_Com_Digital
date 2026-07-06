@@ -16,7 +16,7 @@ module DE2_115_BluetoothSPP_Slave(
 
 	//////////// LED //////////
 	output		     [8:0]		LEDG,
-	output	reg     [17:0]		LEDR,
+	output   		  [17:0]		LEDR,
 
 	//////////// KEY //////////
 	input 		     [3:0]		KEY,
@@ -185,7 +185,7 @@ module DE2_115_BluetoothSPP_Slave(
 	inout 		          		LSENSOR_SCL,
 	inout 		          		LSENSOR_SDA,
 	output		          		MPU_AD0_SDO,
-	output		          		MPU_CS_n,
+	input		          			MPU_CS_n,
 	output		          		MPU_FSYNC,
 	input 		          		MPU_INT,
 	inout 		          		MPU_SCL_SCLK,
@@ -227,6 +227,36 @@ wire	         rdempty;
 wire	         write;
 reg	     	   read;
 reg	         cnt;
+
+// ======================================================
+// 	THINGS OF THE PROJECT
+// ======================================================
+reg [2:0] 	state = 3'd0;
+reg [2:0] 	prev_state = 3'd0;
+reg [15:0] 	temp1_reg, temp2_reg;
+reg        	alerta_reg;
+reg		  	buzzer_reg;
+
+// Parâmetros da FSM
+localparam IDLE   = 3'd0,
+           GET_T1_L = 3'd1,
+           GET_T1_H = 3'd2,
+           GET_T2_L = 3'd3,
+           GET_T2_H = 3'd4,
+           GET_BIN  = 3'd5;
+			  
+localparam TEMP_THRESHOLD = 16'd25;
+			  
+reg [29:0] watchdog_msg_cnt; 
+reg conexao_viva;
+reg state_timeout;
+wire vga_pixel_clk;
+wire [9:0] wX, wY;
+wire wBLANK_N;
+
+// Atribuição para o chip DAC da placa
+// assign VGA_SYNC_N = 1'b0;
+// assign VGA_CLK    = vga_pixel_clk;
 //=======================================================
 //  Structural coding
 //=======================================================
@@ -251,33 +281,145 @@ uart_control UART0(
 	
 );	
 
-//read
-always@(posedge CLOCK_50)
-begin
-  if (~rdempty)
-		read <= 1;
-  else
-		read <= 0;
-	end
-assign  write = ( read & (~rdempty) );
+// 7 segments display
+// Instanciação do controlador de display
+display_7seg temp_display(
+    .data(temp1_reg[13:0]), // Passando os bits necessários para 4 dígitos
+    .ligaOUT(1'b1),               // Sempre ligado para teste, ou use uma chave (SW[0])
+    .unid_display(HEX0),          // Conecta diretamente na saída HEX da placa
+    .dez_display(HEX1),
+    .cen_display(HEX2),
+    .mil_display(HEX3)
+);
 
-assign LEDG[0] = EX_IO[0];
+display_7seg umi_display (
+    .data(temp2_reg[13:0]), // Passando os bits necessários para 4 dígitos
+    .ligaOUT(1'b1),               // Sempre ligado para teste, ou use uma chave (SW[0])
+    .unid_display(HEX4),          // Conecta diretamente na saída HEX da placa
+    .dez_display(HEX5),
+    .cen_display(),
+    .mil_display()
+);
 
-// Modificação dentro do módulo principal
-always @(posedge CLOCK_50 or negedge KEY[0])
-begin
-    if(!KEY[0])
-        LEDR <= 18'b0;
-    else if(write) // Quando um novo byte é recebido com sucesso 
-		begin
-			LEDR[1] <=  ~LEDR[1]; // Liga o LEDR1 sempre q algo e recebido
-        // Se o dado recebido (ASCII ou binário) for maior que 1
-        if(uart_data == 8'd1) 
-            LEDR[0] <=  ~LEDR[0]; // Liga o LEDR0
-		end
+
+// assign LEDG[8] = MPU_CS_n;
+
+
+//=======================================================
+// 		MODULO PRINCIPAL
+//=======================================================
+always @(posedge CLOCK_50 or negedge KEY[0]) begin
+    if (!KEY[0]) begin
+        state <= IDLE;
+        read <= 0;
+        temp1_reg <= 0;
+        temp2_reg <= 0;
+        alerta_reg <= 0;
+    end else begin
+        read <= 0;
+		  
+        if (!rdempty && !read) begin
+            read <= 1; 
+            
+            case (state)
+                IDLE: begin
+                    if (uart_data == 8'hAA) // Header
+                        state <= GET_T1_L;
+                end
+                
+                GET_T1_L: begin
+                    temp1_reg[7:0] <= uart_data;
+                    state <= GET_T1_H;
+                end
+                
+                GET_T1_H: begin
+                    temp1_reg[15:8] <= uart_data;
+                    state <= GET_T2_L;
+                end
+                
+                GET_T2_L: begin
+                    temp2_reg[7:0] <= uart_data;
+                    state <= GET_T2_H;
+                end
+                
+                GET_T2_H: begin
+                    temp2_reg[15:8] <= uart_data;
+                    state <= GET_BIN;
+                end
+                
+                GET_BIN: begin
+                    alerta_reg <= (uart_data == 8'd1);
+                    state <= IDLE;
+						  if (temp1_reg >TEMP_THRESHOLD) begin
+                        buzzer_reg <= 1'b1; 
+                    end else begin
+                        buzzer_reg <= 1'b0; 
+                    end
+                end
+                
+                default: state <= IDLE;
+            endcase
+        end
+    end
 end
+
+//=======================================================
+
+// WATCHDOG PARA VER SE PERDEU DADOS NO PACOTE
+//=======================================================
+
+always @(posedge CLOCK_50 or negedge KEY[0]) begin
+    if (!KEY[0]) begin
+        watchdog_msg_cnt <= 0;
+        conexao_viva <= 0;
+    end else begin
+        // Se a FSM está "trabalhando" no mesmo estado
+        if (state == prev_state) begin
+            watchdog_msg_cnt <= watchdog_msg_cnt + 1;
+            
+            // Se passar de 20s (1.000.000 ciclos a 50MHz) 
+            // e não terminou o pacote, algo deu errado.
+            if (watchdog_msg_cnt > 30'd2_000_000_000) begin
+                state_timeout <= 1; // Sinal interno para resetar a FSM
+            end
+        end else begin
+				prev_state <= state;
+            watchdog_msg_cnt <= 0;
+            state_timeout <= 0;
+        end
+		  
+    end
+end
+
+// LEDs e Displays
+assign LEDG[8] = alerta_reg; // LED indica o binário de presença
+assign MPU_AD0_SDO = buzzer_reg; // essa variavel aqui eh o PIN_AE24 (GPIO[27])
+assign LEDR[8] = state_timeout;
+
+assign HEX6 = 7'hFF;
+assign HEX7 = 7'hFF;
+
 
 always@(posedge CLOCK_50)
 	cnt <= cnt + 1;
+
+
+
+vga_with_hw_test_image instancia_vga (
+    .clk(CLOCK_50),           // Conecta no clock de 50MHz da placa (PIN_Y2)
+    .t1_temp(temp1_reg),    // Barramento vindo do seu decodificador Bluetooth
+    .t2_temp(temp2_reg),    // Barramento vindo do seu decodificador Bluetooth
+    .pixel_clk(VGA_CLK),      // Vai direto para a saída física do FPGA
+    .h_sync(VGA_HS),          // Vai direto para a saída física do FPGA
+    .v_sync(VGA_VS),          // Vai direto para a saída física do FPGA
+    .n_blank(VGA_BLANK_N),    // Vai direto para a saída física do FPGA
+    .n_sync(VGA_SYNC_N),      // Vai direto para a saída física do FPGA
+    .blue(VGA_B),             // Vai direto para a saída física do FPGA
+    .green(VGA_G),            // Vai direto para a saída física do FPGA
+    .red(VGA_R),               // Vai direto para a saída física do FPGA
+	 .alerta(alerta_reg),
+	 .alerta_critico(buzzer_reg)
+);
+
 
 endmodule

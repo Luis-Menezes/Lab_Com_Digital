@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<preferences>
+ <debug showDebugMenu="0" />
+ <systemtable filter="All Interfaces">
+  <columns>
+   <connections preferredWidth="175" />
+   <irq preferredWidth="34" />
+   <name preferredWidth="264" />
+  </columns>
+ </systemtable>
+ <library
+   expandedCategories="Library,Library/University Program/Audio &amp; Video,Library/University Program,Project,Library/University Program/Audio &amp; Video/Video" />
+ <window width="2418" height="1308" x="-9" y="-9" />
+</preferences>
